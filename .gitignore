@@ -17,5 +17,8 @@ models/*.pth
 models/*.pt
 models/*.bin
 models/*.safetensors
+models/
+
+test.ipynb
 
 *.log
