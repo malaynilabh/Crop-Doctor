@@ -1,3 +1,4 @@
+import re
 import sys
 from pathlib import Path
 
@@ -22,6 +23,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.crop_doctor.inference import load_model, predict_image
 from src.crop_doctor.transforms import create_eval_transform
+from src.crop_doctor.llm import LLMConfigError, chat_with_expert, generate_diagnosis_explanation
+from src.crop_doctor.prompts import LANGUAGE_OPTIONS
 
 
 # ============================================================
@@ -51,6 +54,92 @@ USER_INITIALS = "MN"          # swap for the logged-in user's initials
 HIGH_CONF_THRESHOLD = 0.80
 MED_CONF_THRESHOLD = 0.50
 
+LANGUAGE_FLAGS = {
+    "English": "🌐",
+    "Hindi": "🇮🇳",
+    "German": "🇩🇪",
+    "Spanish": "🇪🇸",
+}
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+st.session_state.setdefault("language", LANGUAGE_OPTIONS[0])
+st.session_state.setdefault("diagnosis", None)          # {"crop": str, "disease": str, "confidence": float, "display": str}
+st.session_state.setdefault("chat_messages", [])         # [{"role": ..., "content": ...}]  — for display only
+st.session_state.setdefault("chat_interaction_id", None)  # server-side conversation memory (Interactions API)
+st.session_state.setdefault("chat_diagnosis_key", None)  # tracks which diagnosis the chat belongs to
+st.session_state.setdefault("llm_cache", {})
+
+
+def cached_llm_text(cache_key, compute_fn):
+    """Avoid re-calling the LLM on every Streamlit rerun for the same inputs."""
+    cache = st.session_state["llm_cache"]
+    if cache_key not in cache:
+        cache[cache_key] = compute_fn()
+    return cache[cache_key]
+
+
+def render_review_meta(review_meta: dict):
+    """Small transparency panel showing what the generator->critic->reviser agent did."""
+    if review_meta["revised"]:
+        st.markdown(
+            "<div class='explain-caption'>🔁 Self-reviewed — the first draft failed a check, "
+            "so the agent revised it.</div>",
+            unsafe_allow_html=True,
+        )
+    elif review_meta["initial_passed"]:
+        st.markdown(
+            "<div class='explain-caption'>✅ Self-reviewed — passed the critic's checks on "
+            "the first draft.</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            "<div class='explain-caption'>⚠️ Self-reviewed — flagged an issue but reached "
+            "the revision limit.</div>",
+            unsafe_allow_html=True,
+        )
+
+    # Left as native st.markdown here on purpose: st.expander is a Streamlit
+    # component with its own theme-matched background (dark bg in dark mode),
+    # unlike our hard-coded-white .panel div — forcing dark text here could
+    # make it invisible against a dark expander body instead.
+    with st.expander("🔍 Show self-review details"):
+        st.markdown(f"- **Passed on first draft:** {review_meta['initial_passed']}")
+        st.markdown(f"- **Was revised:** {review_meta['revised']}")
+        st.markdown(f"- **Critic's final feedback:** {review_meta['feedback']}")
+
+
+def render_llm_error(exc: Exception):
+    """
+    Show a short, readable message for an LLM call failure, with the raw
+    exception tucked behind an expander instead of dumped inline. Detects
+    Gemini's 429 / quota-exceeded response specifically, since that's a
+    rate limit (not a bug) and usually tells you how long to wait.
+    """
+    text = str(exc)
+
+    if isinstance(exc, LLMConfigError):
+        st.warning(f"⚙️ {text}")
+        return
+
+    if "429" in text or "RESOURCE_EXHAUSTED" in text or "quota" in text.lower():
+        retry_match = re.search(r"retry in ([\d.]+)\s*s", text, re.IGNORECASE)
+        wait_hint = f" — retry in about {float(retry_match.group(1)):.0f}s" if retry_match else ""
+        st.warning(
+            f"⏳ Hit Gemini's rate limit{wait_hint}. This is a free-tier quota "
+            "(a handful of requests per minute), not a bug in the app — wait a "
+            "moment and it'll work again."
+        )
+    else:
+        st.warning("Couldn't generate this right now — see details below.")
+
+    with st.expander("Show error details"):
+        st.code(text)
+
 
 # ============================================================
 # CSS
@@ -63,6 +152,15 @@ st.markdown(
     /* ========================================================
        GLOBAL
        ======================================================== */
+
+    /* Tell the browser this page is explicitly light-themed. Without this,
+       some browsers/OS settings auto-invert or force-dark unlabeled pages —
+       which happens at the rendering layer, AFTER our CSS is computed, so
+       no amount of explicit color/!important on our end can fix it. This is
+       almost certainly the real cause of the washed-out text. */
+    html, body, .stApp {
+        color-scheme: light only;
+    }
 
     .stApp,
     [data-testid="stAppViewContainer"] {
@@ -366,6 +464,51 @@ st.markdown(
         height: 100%;
     }
 
+    /* Real CSS classes for LLM-generated text — applied directly to the
+       elements we render (not relying on inline style="...!important",
+       which Streamlit strips from inline attributes, and not relying on a
+       ".panel" ancestor selector, since that ancestor relationship isn't
+       reliable across separate st.markdown() calls). No !important needed:
+       a plain class beats Streamlit's own unscoped `color: inherit` rule
+       through normal cascade order. */
+    .explain-text {
+        color: #1f2d24;
+        margin-bottom: 8px;
+    }
+
+    .explain-list {
+        margin: 4px 0 0 18px;
+        padding: 0;
+        color: #1f2d24;
+    }
+
+    .explain-list li {
+        margin-bottom: 4px;
+        color: #1f2d24;
+    }
+
+    .explain-caption {
+        color: #5c6b61;
+        font-size: 12.5px;
+        margin-top: 8px;
+    }
+
+    .chat-bubble-user {
+        display: flex;
+        justify-content: flex-end;
+        margin: 10px 0 14px 0;
+    }
+
+    .chat-bubble-user-text {
+        max-width: 85%;
+        background: #e8f7ed;
+        color: #1f2d24;
+        border-radius: 10px;
+        padding: 10px 12px;
+        font-size: 12.5px;
+        line-height: 1.5;
+    }
+
     .panel-header {
         display: flex;
         align-items: center;
@@ -556,7 +699,7 @@ st.markdown(
 
     .chat-text {
         font-size: 12.5px;
-        color: #5c6b61;
+        color: #5c6b61 !important;
         background: #f5f7f6;
         border-radius: 10px;
         padding: 10px 12px;
@@ -627,6 +770,23 @@ def panel_header_html(number: int, title: str, right_html: str = "") -> str:
     """
 
 
+def bullet_list_html(items) -> str:
+    return "<ul class='explain-list'>" + "".join(
+        f"<li>{item}</li>" for item in items
+    ) + "</ul>"
+
+
+def dark_text_html(text: str, bold: bool = False) -> str:
+    """
+    Renders text using the .explain-text CSS class (defined in the <style>
+    block) instead of an inline style — Streamlit strips !important out of
+    inline style="" attributes, which silently broke every earlier attempt
+    at forcing text color that way. A real class isn't affected by that.
+    """
+    inner = f"<strong>{text}</strong>" if bold else text
+    return f"<div class='explain-text'>{inner}</div>"
+
+
 # ============================================================
 # LOAD MODEL
 # ============================================================
@@ -657,22 +817,25 @@ with st.sidebar:
     )
 
     st.markdown('<div class="nav-active">', unsafe_allow_html=True)
-    st.button("🏠  Home", use_container_width=True, key="nav_home")
+    st.button("🏠  Home", width="stretch", key="nav_home")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.button("🌿  Detect Disease", use_container_width=True, key="nav_detect")
-    st.button("💬  Ask Crop Doctor", use_container_width=True, disabled=True, key="nav_ask")
-    st.button("📖  Crop Guide", use_container_width=True, disabled=True, key="nav_guide")
-    st.button("ⓘ  About", use_container_width=True, disabled=True, key="nav_about")
+    st.button("🌿  Detect Disease", width="stretch", key="nav_detect")
+    st.button("💬  Ask Crop Doctor", width="stretch", disabled=True, key="nav_ask")
+    st.button("📖  Crop Guide", width="stretch", disabled=True, key="nav_guide")
+    st.button("ⓘ  About", width="stretch", disabled=True, key="nav_about")
 
     st.markdown("")
 
-    st.selectbox(
+    selected_language = st.selectbox(
         "Language",
-        ["English", "Hindi", "German", "Spanish", "French"],
-        index=0,
-        disabled=True,
+        LANGUAGE_OPTIONS,
+        index=LANGUAGE_OPTIONS.index(st.session_state["language"]),
     )
+
+    if selected_language != st.session_state["language"]:
+        st.session_state["language"] = selected_language
+        st.rerun()
 
     st.markdown(
         """
@@ -701,7 +864,7 @@ st.markdown(
     <div class="app-header">
         <div class="app-header-title">🌱&nbsp;&nbsp;AI for Sustainable Agriculture</div>
         <div class="app-header-right">
-            <div class="lang-pill">🌐 English</div>
+            <div class="lang-pill">{LANGUAGE_FLAGS.get(st.session_state["language"], "🌐")} {st.session_state["language"]}</div>
             <div class="avatar-circle">{USER_INITIALS}</div>
         </div>
     </div>
@@ -793,7 +956,7 @@ with upload_col:
 
     if uploaded_file is not None:
         image = Image.open(uploaded_file).convert("RGB")
-        st.image(image, caption="Uploaded plant image", use_container_width=True)
+        st.image(image, caption="Uploaded plant image", width="stretch")
         if st.button("✕ Remove image", key="remove_image"):
             st.rerun()
 
@@ -839,6 +1002,19 @@ with result_col:
             display_name = f"{crop_part} — {disease_part}"
         else:
             display_name = top_class_full
+
+        diagnosis_key = (display_name, round(top_probability, 3))
+        st.session_state["diagnosis"] = {
+            "crop": crop_part if " — " in top_class_full else "Unknown crop",
+            "disease": disease_part if " — " in top_class_full else top_class_full,
+            "confidence": top_probability,
+            "display": display_name,
+        }
+
+        if st.session_state["chat_diagnosis_key"] != diagnosis_key:
+            st.session_state["chat_diagnosis_key"] = diagnosis_key
+            st.session_state["chat_messages"] = []
+            st.session_state["chat_interaction_id"] = None
 
         st.markdown(
             panel_header_html(2, "Prediction Results", confidence_badge_html(top_probability)),
@@ -912,32 +1088,101 @@ with result_col:
 
 
 # ------------------------------------------------------------
-# 3. ASK CROP DOCTOR (disabled / coming soon)
+# 3. ASK CROP DOCTOR (live chat, grounded in the current diagnosis)
 # ------------------------------------------------------------
 
 with chat_col:
-    st.markdown('<div class="panel disabled-panel">', unsafe_allow_html=True)
-    st.markdown(panel_header_html(3, "Ask Crop Doctor"), unsafe_allow_html=True)
-    st.markdown(
-        """
-        <div class="chat-bubble">
-            <div class="chat-avatar">🌱</div>
-            <div class="chat-text">
-                Hi! I'm Crop Doctor. Ask me anything about plant diseases,
-                treatment, or crop care.
+    diagnosis = st.session_state["diagnosis"]
+
+    if diagnosis is None:
+        st.markdown('<div class="panel disabled-panel">', unsafe_allow_html=True)
+        st.markdown(panel_header_html(3, "Ask Crop Doctor"), unsafe_allow_html=True)
+        st.markdown(
+            """
+            <div class="chat-bubble">
+                <div class="chat-avatar">🌱</div>
+                <div class="chat-text">
+                    Hi! I'm Crop Doctor. Diagnose a plant image first, and I'll help you
+                    work through it.
+                </div>
             </div>
-        </div>
-        <div>
-            <span class="suggested-chip">How can I treat this?</span>
-            <span class="suggested-chip">Will this affect my yield?</span>
-            <span class="suggested-chip">Preventive measures?</span>
-        </div>
-        <div class="coming-soon-tag">🔒 Coming soon — LLM + RAG + Agentic AI</div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.text_input("Type your question...", disabled=True, label_visibility="collapsed", key="chat_input_disabled")
-    st.markdown("</div>", unsafe_allow_html=True)
+            <div class="coming-soon-tag">🔒 Upload &amp; analyze an image to start chatting</div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    else:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown(panel_header_html(3, "Ask Crop Doctor"), unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="panel-description">Grounded in: <b>{diagnosis["disease"]}</b> '
+            f'&nbsp;·&nbsp; replying in {st.session_state["language"]}</div>',
+            unsafe_allow_html=True,
+        )
+
+        if not st.session_state["chat_messages"]:
+            st.markdown(
+                """
+                <div class="chat-bubble">
+                    <div class="chat-avatar">🌱</div>
+                    <div class="chat-text">
+                        Hi! I'm Crop Doctor. Ask me anything about this diagnosis —
+                        treatment, yield impact, or how to prevent it next season.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        chat_box = st.container(height=260)
+        with chat_box:
+            for msg in st.session_state["chat_messages"]:
+                if msg["role"] == "assistant":
+                    st.markdown(
+                        f"""
+                        <div class="chat-bubble">
+                            <div class="chat-avatar">🌱</div>
+                            <div class="chat-text">{msg["content"]}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f"""
+                        <div class="chat-bubble-user">
+                            <div class="chat-bubble-user-text">
+                                {msg["content"]}
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+        user_question = st.chat_input("Type your question...")
+
+        if user_question:
+            st.session_state["chat_messages"].append({"role": "user", "content": user_question})
+            try:
+                with st.spinner("Crop Doctor is thinking..."):
+                    reply, new_interaction_id = chat_with_expert(
+                        crop=diagnosis["crop"],
+                        disease=diagnosis["disease"],
+                        confidence=diagnosis["confidence"],
+                        language=st.session_state["language"],
+                        user_message=user_question,
+                        previous_interaction_id=st.session_state["chat_interaction_id"],
+                    )
+                st.session_state["chat_interaction_id"] = new_interaction_id
+                st.session_state["chat_messages"].append({"role": "assistant", "content": reply})
+            except LLMConfigError as exc:
+                st.error(str(exc))
+            except Exception as exc:  # noqa: BLE001
+                render_llm_error(exc)
+            st.rerun()
+
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
@@ -949,25 +1194,116 @@ st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
 
 info_col, treatment_col, prevention_col = st.columns(3)
 
-disabled_panels = [
-    (info_col, 4, "🌿", "Disease Information",
-     "Understand the detected disease, symptoms, causes and affected crops."),
-    (treatment_col, 5, "🛠", "Treatment Recommendations",
-     "Receive AI-powered recommendations for treatment and disease management."),
-    (prevention_col, 6, "🛡", "Prevention Tips",
-     "Learn preventive practices and strategies for healthier crops."),
-]
+diagnosis = st.session_state["diagnosis"]
+language = st.session_state["language"]
 
-for col, number, icon, title, description in disabled_panels:
-    with col:
-        st.markdown('<div class="panel disabled-panel">', unsafe_allow_html=True)
-        st.markdown(panel_header_html(number, f"{icon} {title}"), unsafe_allow_html=True)
+explanation = None
+review_meta = None
+explanation_error = None
+
+if diagnosis is not None:
+    try:
+        cache_key = (
+            "explanation",
+            diagnosis["crop"],
+            diagnosis["disease"],
+            round(diagnosis["confidence"], 3),
+            language,
+        )
+        with st.spinner("🌿 Crop Doctor AI is analyzing the diagnosis... (may pause briefly if a free-tier rate limit is hit)"):
+            explanation, review_meta = cached_llm_text(
+                cache_key,
+                lambda: generate_diagnosis_explanation(
+                    crop=diagnosis["crop"],
+                    disease=diagnosis["disease"],
+                    confidence=diagnosis["confidence"],
+                    language=language,
+                ),
+            )
+    except LLMConfigError as exc:
+        explanation_error = exc
+    except Exception as exc:  # noqa: BLE001
+        explanation_error = exc
+
+
+# ------------------------------------------------------------
+# 4. DISEASE INFORMATION (live — one structured call for the row)
+# ------------------------------------------------------------
+
+with info_col:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown(panel_header_html(4, "🌿 Disease Information"), unsafe_allow_html=True)
+
+    if diagnosis is None:
         st.markdown(
-            f'<div class="panel-description">{description}</div>'
-            '<div class="coming-soon-tag">🔒 Coming soon</div>',
+            '<div class="panel-description">Understand the detected disease, symptoms, '
+            'causes and affected crops.</div>',
             unsafe_allow_html=True,
         )
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.info("Diagnose a plant image to see its summary here.")
+    elif explanation_error:
+        render_llm_error(explanation_error)
+    else:
+        st.markdown(dark_text_html(explanation.diagnosis, bold=True), unsafe_allow_html=True)
+        st.markdown(dark_text_html(explanation.disease_meaning), unsafe_allow_html=True)
+        st.markdown(dark_text_html("Symptoms", bold=True), unsafe_allow_html=True)
+        st.markdown(bullet_list_html(explanation.symptoms), unsafe_allow_html=True)
+        st.markdown(dark_text_html("Possible causes", bold=True), unsafe_allow_html=True)
+        st.markdown(bullet_list_html(explanation.possible_causes), unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='explain-caption'>⚠️ {explanation.uncertainty}</div>",
+            unsafe_allow_html=True,
+        )
+        render_review_meta(review_meta)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ------------------------------------------------------------
+# 5. TREATMENT RECOMMENDATIONS (live)
+# ------------------------------------------------------------
+
+with treatment_col:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown(panel_header_html(5, "🛠 Treatment Recommendations"), unsafe_allow_html=True)
+
+    if diagnosis is None:
+        st.markdown(
+            '<div class="panel-description">Receive AI-powered recommendations for '
+            'treatment and disease management.</div>',
+            unsafe_allow_html=True,
+        )
+        st.info("Diagnose a plant image to get an action plan.")
+    elif explanation_error:
+        render_llm_error(explanation_error)
+    else:
+        for i, step in enumerate(explanation.immediate_steps, start=1):
+            st.markdown(dark_text_html(f"{i}. {step}"), unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ------------------------------------------------------------
+# 6. PREVENTION TIPS (now live too — it's the same structured call)
+# ------------------------------------------------------------
+
+with prevention_col:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown(panel_header_html(6, "🛡 Prevention Tips"), unsafe_allow_html=True)
+
+    if diagnosis is None:
+        st.markdown(
+            '<div class="panel-description">Learn preventive practices and strategies for '
+            'healthier crops.</div>',
+            unsafe_allow_html=True,
+        )
+        st.info("Diagnose a plant image to see prevention tips.")
+    elif explanation_error:
+        render_llm_error(explanation_error)
+    else:
+        st.markdown(bullet_list_html(explanation.prevention), unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ============================================================

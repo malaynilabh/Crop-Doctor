@@ -8,3 +8,6 @@ matplotlib
 scikit-learn
 jupyter
 streamlit
+google-genai
+python-dotenv
+pydantic
